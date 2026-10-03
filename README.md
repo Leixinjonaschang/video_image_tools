@@ -66,7 +66,13 @@ Outputs `outputs/<video>_<start>-<end>.png` (cropped) and `..._full.png` (full f
 
 ### Moving camera
 
-For footage where the camera follows the robot (hand-held, walking alongside), add `--moving-camera`:
+For footage where the camera follows the robot (hand-held, walking alongside), add `--moving-camera`.
+
+![moving-camera example](assets/motion_trail_moving_example.jpg)
+
+<sub>A wheel-legged robot walking sideways at night, filmed hand-held while walking alongside; 6 instances from a 3-second clip. The operator standing behind the robot was removed automatically.</sub>
+
+How it works:
 
 1. [SAM 2](https://huggingface.co/facebook/sam2.1-hiera-small) tracks the robot from a box you draw on the first frame.
 2. Frames are registered with a similarity transform fitted to the ground around the robot's feet, so robots stay upright and undistorted despite parallax.
@@ -75,15 +81,28 @@ For footage where the camera follows the robot (hand-held, walking alongside), a
 
 Needs the optional ML dependencies (PyTorch, transformers). Model weights (~0.4 GB) download on first use; runs on CUDA, Apple MPS or CPU.
 
+#### Usage
+
 ```bash
+# 0. install the optional dependencies (once)
 uv sync --extra sam
 
-# 1. find the robot's box (x0 y0 x1 y1) in the first frame of the clip
+# 1. save the clip's first frame with a pixel grid -> outputs/<video>_<start>-<end>_preview.png
 uv run motion-trail path/to/video.mov --start 4 --end 7 --preview
 
-# 2. make the figure
+# 2. read the robot's box off the grid (left, top, right, bottom) and make the figure
 uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540
+
+# faster (~2x): analyse at 15 fps instead of the source rate
+uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540 --fps 15
+
+# keep the operator in the shot, 8 instances, check the robot masks
+uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540 --keep-people -n 8 --debug
 ```
+
+The box only needs to roughly enclose the robot in the **first frame of the clip**; SAM 2 follows it from there. A 3-second 720p clip takes about 1.5 min on an Apple M-series GPU (most of it SAM 2).
+
+#### Options
 
 | Option | Default | Description |
 | --- | --- | --- |
