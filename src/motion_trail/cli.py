@@ -1,8 +1,8 @@
 """Turn a video clip of a moving robot into a single multi-exposure ("motion trail") image.
 
 Example:
-    uv run motion-trail ../IMG_7966.MOV --start 1:39 --end 1:45
-    uv run motion-trail ../IMG_7966.MOV --start 1:39 --end 1:45 -n 8 --opacity 0.35 1 -o outputs/fade.png
+    uv run motion-trail video.mov --start 1:39 --end 1:45
+    uv run motion-trail video.mov --start 1:39 --end 1:45 -n 8 --opacity 0.35 1 -o outputs/fade.png
 """
 
 import argparse
