@@ -6,6 +6,10 @@ Tools for turning robot videos into paper figures.
 
 Composes several poses of a moving robot from a video clip into one still image (a "multi-exposure" / motion-trail figure).
 
+![motion-trail example](assets/motion_trail_example.png)
+
+<sub>A wheel-legged robot crossing a step, 6 instances from a 6-second iPhone HDR clip (`--start 1:39 --end 1:45`).</sub>
+
 How it works:
 
 1. Decodes the clip with ffmpeg; iPhone HDR (HLG/PQ) footage is tone-mapped to SDR automatically.
