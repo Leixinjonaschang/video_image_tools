@@ -106,32 +106,40 @@ def pick_static(info, targets: list, snap: float, crop, clip: tuple[float, float
     return picked
 
 
-def pick_following(args, info, targets: list) -> list:
-    """Track the robot with SAM 2 and crop every keyframe around it at a constant size."""
-    from .moving import robot_box, segment_robot
+TRACK_FPS = 10
 
-    fps = args.fps or info.fps
-    frames = [f.copy() for _, f in read_clip(info, args.start, args.end, fps=args.fps)]
-    box = robot_box(frames, args.box, args.detect, fps)
-    print(f"tracking the robot in {len(frames)} frames with {args.sam_model}")
-    robot = [(p > 0.5).astype(np.uint8) for p in segment_robot(frames, box, args.sam_model)]
-    gray = [small_gray(f) for f in frames]
-    k = round(args.snap * fps)
-    chosen = []
-    for t in targets:
-        c = min(round((t - args.start) * fps), len(frames) - 1)
-        cands = [i for i in range(max(0, c - k), min(len(frames), c + k + 1)) if robot[i].any()]
-        if not cands:
-            raise SystemExit(f"robot lost near t={t:.2f}s; try a tighter --box or a different --detect text")
-        chosen.append(min(cands, key=lambda i: camera_motion(gray, i)))
-    boxes = [cv2.boundingRect(robot[i]) for i in chosen]
-    crops, gaps = follow_boxes(boxes, frames[0].shape, args.margin, args.aspect)
+
+def pick_following(args, info, targets: list) -> list:
+    """Crop every keyframe around the robot at a constant size.
+
+    Only the robot's position is needed, so SAM 2 tracks it at a reduced frame rate; the keyframes
+    themselves are picked at the full frame rate and the robot's box is interpolated between tracked frames."""
+    from .moving import track_robot
+
+    fps = args.fps or min(info.fps, TRACK_FPS)
+    tracked = [(t, f.copy()) for t, f in read_clip(info, args.start, args.end, fps=fps)]
+    probs, _ = track_robot([f for _, f in tracked], args.video, args.start, args.end, fps, args.box, args.detect,
+                           args.sam_model, cache=not args.no_cache)
+    seen = [(t, cv2.boundingRect((p > 0.5).astype(np.uint8))) for (t, _), p in zip(tracked, probs) if (p > 0.5).any()]
+    if not seen:
+        raise SystemExit("robot not found in the clip; try a tighter --box or a different --detect text")
+    times = np.array([t for t, _ in seen])
+    xyxy = np.array([(x, y, x + w, y + h) for _, (x, y, w, h) in seen], float)
+
+    picked = pick_static(info, targets, args.snap, None, (args.start, args.end))
+    boxes = []
+    for ts, _ in picked:
+        if np.abs(times - ts).min() > 2.5 / fps:
+            raise SystemExit(f"robot lost near t={ts:.2f}s; try a tighter --box or a different --detect text")
+        x0, y0, x1, y1 = (np.interp(ts, times, xyxy[:, j]) for j in range(4))
+        boxes.append((x0, y0, x1 - x0, y1 - y0))
+    crops, gaps = follow_boxes(boxes, picked[0][1].shape, args.margin, args.aspect)
     wanted = args.margin * max(b[3] for b in boxes)
-    for i, g in zip(chosen, gaps):
+    for (ts, _), g in zip(picked, gaps):
         if g < 0.5 * wanted:
-            print(f"  note: at t={args.start + i / fps:.2f}s the robot is {max(g, 0):.0f}px from the panel edge "
+            print(f"  note: at t={ts:.2f}s the robot is {max(g, 0):.0f}px from the panel edge "
                   f"(wanted {wanted:.0f}px) because it is near the edge of the video frame")
-    return [(args.start + i / fps, cut(frames[i], b).copy()) for i, b in zip(chosen, crops)]
+    return [(ts, cut(f, c).copy()) for (ts, f), c in zip(picked, crops)]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -159,8 +167,11 @@ def main(argv: list[str] | None = None) -> None:
     f.add_argument("--margin", type=float, default=0.25,
                    help="space left around the robot on every side, as a fraction of its height (default 0.25)")
     f.add_argument("--aspect", type=float, help="panel width/height ratio (default: fit the robot)")
-    f.add_argument("--fps", type=float, help="track at this frame rate (default: source rate; lower is faster)")
+    f.add_argument("--fps", type=float,
+                   help=f"track the robot at this frame rate (default {TRACK_FPS}; keyframes are always taken at the source rate)")
     f.add_argument("--sam-model", default="facebook/sam2.1-hiera-small", help="Hugging Face SAM 2 video checkpoint")
+    f.add_argument("--no-cache", action="store_true",
+                   help="recompute robot detection and tracking instead of reusing the cached result for this clip")
     args = p.parse_args(argv)
 
     info = probe(args.video)

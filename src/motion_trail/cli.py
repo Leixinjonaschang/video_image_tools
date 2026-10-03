@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--keep-people", action="store_true", help="don't remove people (e.g. operators) from the background")
     m.add_argument("--fps", type=float, help="analyse the clip at this frame rate (default: source rate; lower is faster)")
     m.add_argument("--sam-model", default="facebook/sam2.1-hiera-small", help="Hugging Face SAM 2 video checkpoint")
+    m.add_argument("--no-cache", action="store_true",
+                   help="recompute robot detection and tracking instead of reusing the cached result for this clip")
     p.add_argument("--preview", action="store_true",
                    help="save the clip's first frame with a pixel grid (to read off a manual --box) and exit")
     args = p.parse_args(argv)
@@ -139,9 +141,8 @@ def run_moving(args, info, out: Path) -> None:
 
     fps = args.fps or info.fps
     frames = [f.copy() for _, f in read_clip(info, args.start, args.end, fps=args.fps)]
-    box = moving.robot_box(frames, args.box, args.detect, fps)
-    print(f"segmenting the robot in {len(frames)} frames with {args.sam_model}")
-    probs = moving.segment_robot(frames, box, args.sam_model)
+    probs, box = moving.track_robot(frames, args.video, args.start, args.end, fps, args.box, args.detect,
+                                    args.sam_model, cache=not args.no_cache)
     robot = [(p > 0.5).astype(np.uint8) for p in probs]
     print("registering frames")
     ground = moving.ground_motion(frames, robot)

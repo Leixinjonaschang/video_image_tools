@@ -6,12 +6,18 @@ are removed from the chosen frames using a far-background-aligned median of the 
 the chosen frames are stitched as feathered strips, one per robot instance, onto a wide canvas.
 """
 
+import hashlib
+import os
 import warnings
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .composite import to_lab
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "video_image_tools"
+CACHE_VERSION = 1  # bump when detection/tracking changes so old results aren't reused
 
 
 def torch_device() -> str:
@@ -98,6 +104,29 @@ def robot_box(frames: list, box, text: str, fps: float) -> list[float]:
     note = f", the moving one of {len(cands)} candidates" if pick else ""
     print(f"  found at {' '.join(f'{v:.0f}' for v in box)} (score {score:.2f}{note}); pass --box to override")
     return box
+
+
+def track_robot(frames: list, video: Path, start: float, end: float, fps: float, box, text: str,
+                model_id: str, cache: bool = True) -> tuple[np.ndarray, list[float]]:
+    """Robot probability maps for every frame of the clip, plus the first-frame box they came from.
+
+    Detection + SAM 2 is the slow part of the pipeline, so the result is cached on disk per clip and
+    prompt; re-running with different layout options then skips it."""
+    video = Path(video).resolve()
+    stat = video.stat()
+    prompt = f"box={[round(float(v), 1) for v in box]}" if box else f"detect={text}"
+    key = f"v{CACHE_VERSION}|{video}|{stat.st_size}|{stat.st_mtime_ns}|{start}|{end}|{fps}|{len(frames)}|{prompt}|{model_id}"
+    path = CACHE_DIR / f"{video.stem}_{start:g}-{end:g}_{hashlib.sha1(key.encode()).hexdigest()[:10]}.npz"
+    if cache and path.exists():
+        print(f"reusing cached robot tracking ({path}); pass --no-cache to recompute")
+        data = np.load(path)
+        return data["probs"].astype(np.float32) / 255, data["box"].tolist()
+    box = robot_box(frames, box, text, fps)
+    print(f"tracking the robot in {len(frames)} frames with {model_id}")
+    probs = np.round(segment_robot(frames, box, model_id) * 255).astype(np.uint8)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, probs=probs, box=np.array(box, float))
+    return probs.astype(np.float32) / 255, box
 
 
 def segment_robot(frames: list, box: tuple, model_id: str) -> np.ndarray:

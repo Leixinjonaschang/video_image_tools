@@ -30,6 +30,8 @@ If the wrong thing is picked, describe the robot more specifically (`--detect "w
 
 The models download on first use, about 1.1 GB in total: Grounding DINO tiny (~690 MB), SAM 2.1 small (~180 MB) and, for removing people in `--moving-camera`, Mask R-CNN (~190 MB). Everything runs on CUDA, Apple MPS or CPU.
 
+Detection and tracking are the slow part, so their result is cached per clip in `~/.cache/video_image_tools` (about 1 MB each). Re-running the same clip with different layout options (`-n`, `--margin`, `--order`, `--cols`, ...) reuses it; changing the clip, `--fps`, `--box`/`--detect` or `--sam-model` tracks again. Pass `--no-cache` to force a fresh run, or delete that folder to clear the cache.
+
 ## motion-trail
 
 Composes several poses of a moving robot from a video clip into one still image (a "multi-exposure" / motion-trail figure).
@@ -116,7 +118,7 @@ uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --detect
 uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540
 ```
 
-A 3-second 720p clip takes about 40 s on an Apple M5 GPU, about half of it SAM 2 tracking (run in bfloat16 on GPUs, ~3x faster than float32 with near-identical masks).
+A 3-second 720p clip takes about 40 s on an Apple M5 GPU, about half of it SAM 2 tracking (run in bfloat16 on GPUs, ~3x faster than float32 with near-identical masks). Re-running the same clip takes about 10 s, since the tracking is cached.
 
 #### Options
 
@@ -128,6 +130,7 @@ A 3-second 720p clip takes about 40 s on an Apple M5 GPU, about half of it SAM 2
 | `--keep-people` | off | Don't remove people from the background |
 | `--fps` | source rate | Analyse the clip at a lower frame rate; `15` halves the frames to track |
 | `--sam-model` | `facebook/sam2.1-hiera-small` | SAM 2 video checkpoint on Hugging Face |
+| `--no-cache` | off | Recompute detection and tracking instead of reusing the cached result |
 
 `--num`, `--spacing`, `--times`, `--order`, `--margin`, `--aspect`, `--no-crop`, `-o` and `--debug` work as above; `--opacity`, `--thresh` and `--bg-range` don't apply.
 
@@ -189,6 +192,8 @@ Outputs `outputs/<video>_<start>-<end>_keyframes.png`.
 | `--box X0 Y0 X1 Y1` | found automatically | With `--follow`: robot bounding box in the clip's first frame; overrides `--detect` |
 | `--margin` | `0.25` | With `--follow`: space around the robot on every side, as a fraction of its height |
 | `--aspect` | fit the robot | With `--follow`: panel width/height ratio |
-| `--fps`, `--sam-model` | source rate, `sam2.1-hiera-small` | With `--follow`: tracking frame rate and checkpoint |
+| `--fps` | `10` | With `--follow`: frame rate for tracking the robot; keyframes are always taken at the source rate |
+| `--sam-model` | `sam2.1-hiera-small` | With `--follow`: SAM 2 checkpoint |
+| `--no-cache` | off | With `--follow`: recompute detection and tracking instead of reusing the cached result |
 
-With `--follow`, if the robot is closer to the edge of the video frame than the margin allows, the panel can't extend past the footage; the tool prints a note for those frames.
+With `--follow`, if the robot is closer to the edge of the video frame than the margin allows, the panel can't extend past the footage; the tool prints a note for those frames. On a 3-second clip `--follow` takes about 15 s the first time and under a second when re-run with other layout options.
