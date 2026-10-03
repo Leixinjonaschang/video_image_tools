@@ -1,6 +1,22 @@
 # video_image_tools
 
-Tools for turning robot videos into paper figures.
+Tools for turning robot videos into paper figures:
+
+- [`motion-trail`](#motion-trail): several poses of a moving robot composed into one scene.
+- [`keyframes`](#keyframes): N keyframes of a clip as side-by-side panels.
+
+## Install
+
+Requires [uv](https://docs.astral.sh/uv/). ffmpeg is bundled via `imageio-ffmpeg`, so no system install is needed.
+
+```bash
+git clone https://github.com/Leixinjonaschang/video_image_tools.git
+cd video_image_tools
+uv sync                # core tools
+uv sync --extra sam    # optional: SAM 2 robot tracking (motion-trail --moving-camera, keyframes --follow)
+```
+
+Both tools decode iPhone HDR (HLG/PQ) footage with automatic tone-mapping to SDR, accept times as seconds (`99.5`) or `m:ss` (`1:39.5`), and offer `--preview` to save the clip's first frame with a pixel grid for reading off box coordinates.
 
 ## motion-trail
 
@@ -18,16 +34,6 @@ How it works:
 4. Picks frames evenly spaced along the robot's path, pastes them onto the background, and crops to the motion.
 
 This default mode assumes a **static camera** and **one moving object** in the clip. For hand-held or tracking shots, see [Moving camera](#moving-camera).
-
-### Install
-
-Requires [uv](https://docs.astral.sh/uv/). ffmpeg is bundled via `imageio-ffmpeg`, so no system install is needed.
-
-```bash
-git clone https://github.com/Leixinjonaschang/video_image_tools.git
-cd video_image_tools
-uv sync
-```
 
 ### Usage
 
@@ -121,3 +127,52 @@ The box only needs to roughly enclose the robot in the **first frame of the clip
 - **Instances overlap too much**: reduce `-n` or use a longer clip.
 - **Moving camera, robot mask wrong**: check `--debug` overlays; tighten `--box`, or try `--sam-model facebook/sam2.1-hiera-large`.
 - **Moving camera, ghosts of people left over**: use the full frame rate (drop `--fps`) so more frames are available to fill from.
+
+## keyframes
+
+Picks N keyframes from a clip and tiles them side by side, optionally cropped to follow the robot.
+
+![keyframes example](assets/keyframes_example.jpg)
+
+<sub>4 keyframes from a 3-second hand-held clip with `--follow`: every panel is the same size, centred on the robot.</sub>
+
+- Keyframes are evenly spaced in time from `--start` to `--end` (or given with `--times`).
+- Around each target time, the frame with the least camera motion (within `--snap` seconds) is used, which avoids motion-blurred frames from hand-held footage.
+- Panels are full frames, a fixed `--crop` region, or (with `--follow`) equal-size crops centred on the robot tracked by SAM 2, with `--margin` of space left on every side.
+
+### Usage
+
+```bash
+# 4 full frames in one row
+uv run keyframes path/to/video.mov --start 4 --end 7 -n 4
+
+# same crop for every panel, 2x2 grid
+uv run keyframes path/to/video.mov --start 4 --end 7 -n 4 --crop 380 0 1000 720 --cols 2
+
+# follow the robot (box read off the --preview image), extra space around it
+uv run keyframes path/to/video.mov --start 4 --end 7 -n 4 --follow --box 670 250 820 540 --margin 0.3
+```
+
+Outputs `outputs/<video>_<start>-<end>_keyframes.png`.
+
+### Options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `video` | – | Input video file |
+| `--start`, `--end` | required | Clip range |
+| `-n`, `--num` | `4` | Number of keyframes, evenly spaced in time |
+| `--times T [T ...]` | – | Explicit timestamps; overrides `--num` |
+| `--snap` | `0.1` | Use the least motion-blurred frame within ±`SNAP` seconds of each target (`0` = exact) |
+| `--crop X0 Y0 X1 Y1` | full frame | Crop every panel to this box, in video pixels |
+| `--cols` | all in one row | Panels per row |
+| `--gap` | `6` | White gap between panels, in pixels |
+| `-o`, `--out` | `outputs/...png` | Output image path |
+| `--preview` | off | Save the clip's first frame with a pixel grid and exit |
+| `--follow` | off | Track the robot with SAM 2 and centre each panel on it (needs `--extra sam`) |
+| `--box X0 Y0 X1 Y1` | required with `--follow` | Robot bounding box in the clip's first frame |
+| `--margin` | `0.25` | With `--follow`: space around the robot on every side, as a fraction of its height |
+| `--aspect` | fit the robot | With `--follow`: panel width/height ratio |
+| `--fps`, `--sam-model` | source rate, `sam2.1-hiera-small` | With `--follow`: tracking frame rate and checkpoint |
+
+With `--follow`, if the robot is closer to the edge of the video frame than the margin allows, the panel can't extend past the footage; the tool prints a note for those frames.
