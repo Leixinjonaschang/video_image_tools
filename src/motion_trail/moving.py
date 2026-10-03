@@ -106,10 +106,13 @@ def segment_robot(frames: list, box: tuple, model_id: str) -> np.ndarray:
     from transformers import Sam2VideoModel, Sam2VideoProcessor
 
     dev = torch_device()
-    model = Sam2VideoModel.from_pretrained(model_id).to(dev)
+    # bfloat16 is ~2.5x faster than float32 on GPUs (measured on Apple M5) with near-identical masks.
+    fast = dev == "mps" or (dev == "cuda" and torch.cuda.is_bf16_supported())
+    dtype = torch.bfloat16 if fast else torch.float32
+    model = Sam2VideoModel.from_pretrained(model_id).to(dev, dtype=dtype)
     proc = Sam2VideoProcessor.from_pretrained(model_id)
     rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
-    sess = proc.init_video_session(video=rgb, inference_device=dev, video_storage_device="cpu")
+    sess = proc.init_video_session(video=rgb, inference_device=dev, video_storage_device="cpu", dtype=dtype)
     proc.add_inputs_to_inference_session(
         inference_session=sess, frame_idx=0, obj_ids=1, input_boxes=[[[float(v) for v in box]]]
     )
@@ -118,8 +121,8 @@ def segment_robot(frames: list, box: tuple, model_id: str) -> np.ndarray:
     with torch.inference_mode():
         model(inference_session=sess, frame_idx=0)
         for out in model.propagate_in_video_iterator(sess, show_progress_bar=True):
-            m = proc.post_process_masks([out.pred_masks], original_sizes=size, binarize=False)[0]
-            probs[out.frame_idx] = torch.sigmoid(m[0, 0]).float().cpu().numpy()
+            m = proc.post_process_masks([out.pred_masks.float()], original_sizes=size, binarize=False)[0]
+            probs[out.frame_idx] = torch.sigmoid(m[0, 0]).cpu().numpy()
     return probs
 
 

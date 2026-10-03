@@ -105,7 +105,7 @@ Needs the optional ML dependencies (`uv sync --extra sam`).
 # the robot is found automatically
 uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera
 
-# faster (~2x): analyse at 15 fps instead of the source rate
+# faster: analyse at 15 fps instead of the source rate (half the frames to track)
 uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --fps 15
 
 # keep the operator in the shot, 8 instances, save box/mask overlays for checking
@@ -116,7 +116,7 @@ uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --detect
 uv run motion-trail path/to/video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540
 ```
 
-A 3-second 720p clip takes about 1.5 min on an Apple M-series GPU (most of it SAM 2).
+A 3-second 720p clip takes about 40 s on an Apple M5 GPU, about half of it SAM 2 tracking (run in bfloat16 on GPUs, ~3x faster than float32 with near-identical masks).
 
 #### Options
 
@@ -126,7 +126,7 @@ A 3-second 720p clip takes about 1.5 min on an Apple M-series GPU (most of it SA
 | `--detect TEXT` | `robot` | What to look for in the first frame (see [Finding the robot](#finding-the-robot)) |
 | `--box X0 Y0 X1 Y1` | found automatically | Robot bounding box in the clip's first frame, in video pixels; overrides `--detect` |
 | `--keep-people` | off | Don't remove people from the background |
-| `--fps` | source rate | Analyse the clip at a lower frame rate; `15` is about 2× faster |
+| `--fps` | source rate | Analyse the clip at a lower frame rate; `15` halves the frames to track |
 | `--sam-model` | `facebook/sam2.1-hiera-small` | SAM 2 video checkpoint on Hugging Face |
 
 `--num`, `--spacing`, `--times`, `--order`, `--margin`, `--aspect`, `--no-crop`, `-o` and `--debug` work as above; `--opacity`, `--thresh` and `--bg-range` don't apply.
