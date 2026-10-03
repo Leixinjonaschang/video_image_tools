@@ -11,6 +11,8 @@ import warnings
 import cv2
 import numpy as np
 
+from .composite import to_lab
+
 
 def torch_device() -> str:
     import torch
@@ -20,6 +22,82 @@ def torch_device() -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+DETECTOR = "IDEA-Research/grounding-dino-tiny"
+
+
+def detect(frame: np.ndarray, text: str, threshold: float = 0.2) -> list[tuple[list[float], float]]:
+    """Boxes (x0, y0, x1, y1) matching `text` with their scores, best first, from Grounding DINO."""
+    import torch
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+    dev = torch_device()
+    proc = AutoProcessor.from_pretrained(DETECTOR)
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(DETECTOR).to(dev).eval()
+    inputs = proc(images=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), text=[[text]], return_tensors="pt").to(dev)
+    with torch.inference_mode():
+        outputs = model(**inputs)
+    found = proc.post_process_grounded_object_detection(
+        outputs, inputs.input_ids, threshold=threshold, text_threshold=threshold, target_sizes=[frame.shape[:2]]
+    )[0]
+    h, w = frame.shape[:2]
+    limits = (w, h, w, h)
+    boxes = [([round(min(max(float(v), 0.0), lim), 1) for v, lim in zip(b, limits)], float(s))
+             for b, s in zip(found["boxes"], found["scores"])]
+    return sorted(boxes, key=lambda c: -c[1])
+
+
+def motion_in_boxes(frames: list, boxes: list, fps: float) -> np.ndarray:
+    """Mean colour change (ΔE) inside each box between the first frame and frames up to 2 s later,
+    after aligning those frames to the first one: how much each box moves relative to the scene."""
+    h, w = frames[0].shape[:2]
+    sift = cv2.SIFT_create(3000)
+    p0, d0 = _sift(sift, frames[0])
+    lab0 = to_lab(frames[0])
+    ones = np.ones((h, w), np.uint8)
+    motion = np.zeros(len(boxes))
+    for k in sorted({min(len(frames) - 1, round(s * fps)) for s in (0.3, 0.6, 1.0, 1.5, 2.0)} - {0}):
+        pk, dk = _sift(sift, frames[k])
+        hm = None
+        if len(p0) >= 8 and len(pk) >= 8:
+            good = [a for a, b in cv2.BFMatcher().knnMatch(dk, d0, k=2) if a.distance < 0.75 * b.distance]
+            if len(good) >= 8:
+                hm, _ = cv2.findHomography(pk[[a.queryIdx for a in good]], p0[[a.trainIdx for a in good]], cv2.RANSAC, 3.0)
+        hm = np.eye(3) if hm is None else hm
+        valid = cv2.warpPerspective(ones, hm, (w, h))
+        diff = np.linalg.norm(to_lab(cv2.warpPerspective(frames[k], hm, (w, h))) - lab0, axis=2) * valid
+        for c, (x0, y0, x1, y1) in enumerate(boxes):
+            sl = (slice(int(y0), int(y1)), slice(int(x0), int(x1)))
+            if (n := valid[sl].sum()) > 0:
+                motion[c] = max(motion[c], diff[sl].sum() / n)
+    return motion
+
+
+def _sift(sift, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+    kps, desc = sift.detectAndCompute(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), None)
+    return np.float32([k.pt for k in kps]).reshape(-1, 2), desc
+
+
+def robot_box(frames: list, box, text: str, fps: float) -> list[float]:
+    """The user's --box if given, otherwise the `text` detection in the first frame that best combines
+    detector confidence with actually moving (so robots parked in the background are skipped)."""
+    if box:
+        return list(box)
+    print(f'detecting "{text}" in the first frame with {DETECTOR}')
+    cands = detect(frames[0], text)
+    if not cands:
+        raise SystemExit(f'no "{text}" found in the first frame of the clip; '
+                         f'describe it differently with --detect, or give --box (see --preview)')
+    pick = 0
+    if len(cands) > 1:
+        motion = motion_in_boxes(frames, [b for b, _ in cands], fps)
+        if motion.max() >= 4:  # static boxes measure ~2 (noise); below 4 trust the detector alone
+            pick = int(np.argmax([s * m for (_, s), m in zip(cands, motion)]))
+    box, score = cands[pick]
+    note = f", the moving one of {len(cands)} candidates" if pick else ""
+    print(f"  found at {' '.join(f'{v:.0f}' for v in box)} (score {score:.2f}{note}); pass --box to override")
+    return box
 
 
 def segment_robot(frames: list, box: tuple, model_id: str) -> np.ndarray:

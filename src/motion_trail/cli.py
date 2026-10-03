@@ -3,7 +3,7 @@
 Example:
     uv run motion-trail video.mov --start 1:39 --end 1:45
     uv run motion-trail video.mov --start 1:39 --end 1:45 -n 8 --opacity 0.35 1 -o outputs/fade.png
-    uv run motion-trail video.mov --start 4 --end 7 --preview
+    uv run motion-trail video.mov --start 4 --end 7 --moving-camera
     uv run motion-trail video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540
 """
 
@@ -70,13 +70,15 @@ def main(argv: list[str] | None = None) -> None:
     m = p.add_argument_group("moving camera (needs `uv sync --extra sam`)")
     m.add_argument("--moving-camera", action="store_true",
                    help="for hand-held / tracking shots: segment with SAM 2, register frames, stitch a panorama")
+    m.add_argument("--detect", default="robot", metavar="TEXT",
+                   help='what to look for in the first frame when --box is not given (default "robot")')
     m.add_argument("--box", type=float, nargs=4, metavar=("X0", "Y0", "X1", "Y1"),
-                   help="robot bounding box in the first frame of the clip, in video pixels (see --preview)")
+                   help="robot bounding box in the first frame of the clip, in video pixels; overrides --detect")
     m.add_argument("--keep-people", action="store_true", help="don't remove people (e.g. operators) from the background")
     m.add_argument("--fps", type=float, help="analyse the clip at this frame rate (default: source rate; lower is faster)")
     m.add_argument("--sam-model", default="facebook/sam2.1-hiera-small", help="Hugging Face SAM 2 video checkpoint")
     p.add_argument("--preview", action="store_true",
-                   help="save the clip's first frame with a pixel grid (to read off --box) and exit")
+                   help="save the clip's first frame with a pixel grid (to read off a manual --box) and exit")
     args = p.parse_args(argv)
 
     info = probe(args.video)
@@ -95,8 +97,6 @@ def main(argv: list[str] | None = None) -> None:
         cv2.imwrite(str(path), draw_grid(first))
         print(f"saved {path}")
     elif args.moving_camera:
-        if not args.box:
-            p.error("--moving-camera needs --box (use --preview to read coordinates off the first frame)")
         if tuple(args.opacity) != (1.0, 1.0):
             p.error("--opacity is not supported with --moving-camera: the background behind each robot is unknown")
         run_moving(args, info, out)
@@ -139,8 +139,9 @@ def run_moving(args, info, out: Path) -> None:
 
     fps = args.fps or info.fps
     frames = [f.copy() for _, f in read_clip(info, args.start, args.end, fps=args.fps)]
+    box = moving.robot_box(frames, args.box, args.detect, fps)
     print(f"segmenting the robot in {len(frames)} frames with {args.sam_model}")
-    probs = moving.segment_robot(frames, args.box, args.sam_model)
+    probs = moving.segment_robot(frames, box, args.sam_model)
     robot = [(p > 0.5).astype(np.uint8) for p in probs]
     print("registering frames")
     ground = moving.ground_motion(frames, robot)
@@ -173,6 +174,8 @@ def run_moving(args, info, out: Path) -> None:
     if args.debug:
         dbg_dir = out.with_name(out.stem + "_debug")
         dbg_dir.mkdir(exist_ok=True)
+        x0, y0, x1, y1 = (int(v) for v in box)
+        cv2.imwrite(str(dbg_dir / "box.jpg"), cv2.rectangle(frames[0].copy(), (x0, y0), (x1, y1), (0, 0, 255), 3))
         for k, i in enumerate(indices):
             cv2.imwrite(str(dbg_dir / f"mask_{k:02d}.jpg"), overlay_debug(clean[i], probs[i]))
         print(f"debug images in {dbg_dir}")

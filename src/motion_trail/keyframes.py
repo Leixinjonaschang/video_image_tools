@@ -3,6 +3,7 @@
 Examples:
     uv run keyframes video.mov --start 4 --end 7 -n 4
     uv run keyframes video.mov --start 4 --end 7 -n 4 --crop 380 0 1000 720
+    uv run keyframes video.mov --start 4 --end 7 -n 4 --follow
     uv run keyframes video.mov --start 4 --end 7 -n 4 --follow --box 670 250 820 540
 """
 
@@ -107,12 +108,13 @@ def pick_static(info, targets: list, snap: float, crop, clip: tuple[float, float
 
 def pick_following(args, info, targets: list) -> list:
     """Track the robot with SAM 2 and crop every keyframe around it at a constant size."""
-    from .moving import segment_robot
+    from .moving import robot_box, segment_robot
 
     fps = args.fps or info.fps
     frames = [f.copy() for _, f in read_clip(info, args.start, args.end, fps=args.fps)]
+    box = robot_box(frames, args.box, args.detect, fps)
     print(f"tracking the robot in {len(frames)} frames with {args.sam_model}")
-    robot = [(p > 0.5).astype(np.uint8) for p in segment_robot(frames, args.box, args.sam_model)]
+    robot = [(p > 0.5).astype(np.uint8) for p in segment_robot(frames, box, args.sam_model)]
     gray = [small_gray(f) for f in frames]
     k = round(args.snap * fps)
     chosen = []
@@ -120,7 +122,7 @@ def pick_following(args, info, targets: list) -> list:
         c = min(round((t - args.start) * fps), len(frames) - 1)
         cands = [i for i in range(max(0, c - k), min(len(frames), c + k + 1)) if robot[i].any()]
         if not cands:
-            raise SystemExit(f"robot not found near t={t:.2f}s; check --box")
+            raise SystemExit(f"robot lost near t={t:.2f}s; try a tighter --box or a different --detect text")
         chosen.append(min(cands, key=lambda i: camera_motion(gray, i)))
     boxes = [cv2.boundingRect(robot[i]) for i in chosen]
     crops, gaps = follow_boxes(boxes, frames[0].shape, args.margin, args.aspect)
@@ -150,8 +152,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="save the clip's first frame with a pixel grid (to read off --crop / --box) and exit")
     f = p.add_argument_group("follow the robot (needs `uv sync --extra sam`)")
     f.add_argument("--follow", action="store_true", help="track the robot with SAM 2 and centre each panel on it")
+    f.add_argument("--detect", default="robot", metavar="TEXT",
+                   help='what to look for in the first frame when --box is not given (default "robot")')
     f.add_argument("--box", type=float, nargs=4, metavar=("X0", "Y0", "X1", "Y1"),
-                   help="robot bounding box in the first frame of the clip, in video pixels")
+                   help="robot bounding box in the first frame of the clip, in video pixels; overrides --detect")
     f.add_argument("--margin", type=float, default=0.25,
                    help="space left around the robot on every side, as a fraction of its height (default 0.25)")
     f.add_argument("--aspect", type=float, help="panel width/height ratio (default: fit the robot)")
@@ -165,8 +169,6 @@ def main(argv: list[str] | None = None) -> None:
         p.error(f"need 0 <= start < end <= {info.duration:.2f}s")
     if args.times and not all(start <= t < end for t in args.times):
         p.error("all --times must lie within [--start, --end)")
-    if args.follow and not args.box:
-        p.error("--follow needs --box (use --preview to read coordinates off the first frame)")
     if args.follow and args.crop:
         p.error("use either --crop or --follow, not both")
     out = args.out or Path("outputs") / f"{args.video.stem}_{start:g}-{end:g}_keyframes.png"
