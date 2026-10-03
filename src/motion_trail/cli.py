@@ -3,6 +3,8 @@
 Example:
     uv run motion-trail video.mov --start 1:39 --end 1:45
     uv run motion-trail video.mov --start 1:39 --end 1:45 -n 8 --opacity 0.35 1 -o outputs/fade.png
+    uv run motion-trail video.mov --start 4 --end 7 --preview
+    uv run motion-trail video.mov --start 4 --end 7 --moving-camera --box 670 250 820 540
 """
 
 import argparse
@@ -65,21 +67,122 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--no-crop", action="store_true", help="keep the full frame")
     p.add_argument("-o", "--out", type=Path, help="output image (default: outputs/<video>_<start>-<end>.png)")
     p.add_argument("--debug", action="store_true", help="also save per-instance mask overlays")
+    m = p.add_argument_group("moving camera (needs `uv sync --extra sam`)")
+    m.add_argument("--moving-camera", action="store_true",
+                   help="for hand-held / tracking shots: segment with SAM 2, register frames, stitch a panorama")
+    m.add_argument("--box", type=float, nargs=4, metavar=("X0", "Y0", "X1", "Y1"),
+                   help="robot bounding box in the first frame of the clip, in video pixels (see --preview)")
+    m.add_argument("--keep-people", action="store_true", help="don't remove people (e.g. operators) from the background")
+    m.add_argument("--fps", type=float, help="analyse the clip at this frame rate (default: source rate; lower is faster)")
+    m.add_argument("--sam-model", default="facebook/sam2.1-hiera-small", help="Hugging Face SAM 2 video checkpoint")
+    p.add_argument("--preview", action="store_true",
+                   help="save the clip's first frame with a pixel grid (to read off --box) and exit")
     args = p.parse_args(argv)
 
     info = probe(args.video)
     start, end = args.start, args.end
     if not 0 <= start < end <= info.duration:
         p.error(f"need 0 <= start < end <= {info.duration:.2f}s")
-    bg_range = tuple(args.bg_range) if args.bg_range else (start, end)
-    lo, hi = args.thresh
+    if args.times and not all(start <= t < end for t in args.times):
+        p.error("all --times must lie within [--start, --end)")
     out = args.out or Path("outputs") / f"{args.video.stem}_{start:g}-{end:g}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"{args.video.name}: {info.width}x{info.height} @ {info.fps:g} fps{', HDR -> SDR' if info.is_hdr else ''}")
 
+    if args.preview:
+        _, first = next(read_clip(info, start, end))
+        path = out.with_name(out.stem + "_preview.png")
+        cv2.imwrite(str(path), draw_grid(first))
+        print(f"saved {path}")
+    elif args.moving_camera:
+        if not args.box:
+            p.error("--moving-camera needs --box (use --preview to read coordinates off the first frame)")
+        if tuple(args.opacity) != (1.0, 1.0):
+            p.error("--opacity is not supported with --moving-camera: the background behind each robot is unknown")
+        run_moving(args, info, out)
+    else:
+        run_static(args, info, out)
+
+
+def draw_grid(img: np.ndarray, step: int = 100) -> np.ndarray:
+    img = img.copy()
+    h, w = img.shape[:2]
+    for x in range(0, w, step):
+        cv2.line(img, (x, 0), (x, h), (0, 255, 255), 1)
+        cv2.putText(img, str(x), (x + 3, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+    for y in range(step, h, step):
+        cv2.line(img, (0, y), (w, y), (0, 255, 255), 1)
+        cv2.putText(img, str(y), (3, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+    return img
+
+
+def save(result: np.ndarray, masks: list, args, out: Path, coverage: np.ndarray | None = None) -> None:
+    if not args.no_crop:
+        box = crop_box(masks, result.shape, args.margin, args.aspect)
+        if coverage is not None:
+            from .moving import fit_inside
+
+            box = fit_inside(box, coverage)
+        cv2.imwrite(str(out.with_name(out.stem + "_full" + out.suffix)), result)
+        x0, y0, x1, y1 = box
+        result = result[y0:y1, x0:x1]
+    cv2.imwrite(str(out), result)
+    print(f"saved {out} ({result.shape[1]}x{result.shape[0]})")
+
+
+def opacity_ramp(args, n: int) -> np.ndarray:
+    return np.linspace(*args.opacity, n) if n > 1 else np.array([args.opacity[1]])
+
+
+def run_moving(args, info, out: Path) -> None:
+    from . import moving
+
+    fps = args.fps or info.fps
+    frames = [f.copy() for _, f in read_clip(info, args.start, args.end, fps=args.fps)]
+    print(f"segmenting the robot in {len(frames)} frames with {args.sam_model}")
+    probs = moving.segment_robot(frames, args.box, args.sam_model)
+    robot = [(p > 0.5).astype(np.uint8) for p in probs]
+    print("registering frames")
+    ground = moving.ground_motion(frames, robot)
+
     if args.times:
-        if not all(start <= t < end for t in args.times):
-            p.error("all --times must lie within [--start, --end)")
+        indices = sorted({min(round((t - args.start) * fps), len(frames) - 1) for t in args.times})
+    else:
+        feet = []
+        for a, r in zip(ground, robot):
+            if not r.any():
+                feet.append(None)
+                continue
+            x, y, w, h = cv2.boundingRect(r)
+            feet.append((a @ [x + w / 2, y + h, 1])[:2])
+        indices = select_indices(feet, args.num, args.spacing)
+    print("using frames at t =", ", ".join(f"{args.start + i / fps:.2f}s" for i in indices))
+
+    clean = {i: frames[i] for i in indices}
+    if not args.keep_people:
+        print("removing people")
+        people = moving.detect_people(frames, indices, robot)
+        feats = moving.far_features(frames, robot)
+        for i in indices:
+            if people[i].any():
+                clean[i] = moving.remove_people(frames, i, people[i], feats, robot)
+
+    result, coverage, masks = moving.stitch(clean, ground, probs, indices, later_on_top=args.order == "later")
+    save(result, masks, args, out, coverage)
+
+    if args.debug:
+        dbg_dir = out.with_name(out.stem + "_debug")
+        dbg_dir.mkdir(exist_ok=True)
+        for k, i in enumerate(indices):
+            cv2.imwrite(str(dbg_dir / f"mask_{k:02d}.jpg"), overlay_debug(clean[i], probs[i]))
+        print(f"debug images in {dbg_dir}")
+
+
+def run_static(args, info, out: Path) -> None:
+    start, end = args.start, args.end
+    bg_range = tuple(args.bg_range) if args.bg_range else (start, end)
+    lo, hi = args.thresh
+    if args.times:
         indices = sorted({round((t - start) * info.fps) for t in args.times})
     else:
         centroids = track(info, start, end, bg_range, hi)
@@ -104,14 +207,8 @@ def main(argv: list[str] | None = None) -> None:
     if not frames:
         raise SystemExit("no object found in any selected frame; try lowering --thresh")
 
-    opacities = np.linspace(*args.opacity, len(frames)) if len(frames) > 1 else [args.opacity[1]]
-    result = composite(bg, frames, alphas, opacities, later_on_top=args.order == "later")
-    if not args.no_crop:
-        x0, y0, x1, y1 = crop_box(masks, result.shape, args.margin, args.aspect)
-        cv2.imwrite(str(out.with_name(out.stem + "_full" + out.suffix)), result)
-        result = result[y0:y1, x0:x1]
-    cv2.imwrite(str(out), result)
-    print(f"saved {out} ({result.shape[1]}x{result.shape[0]})")
+    result = composite(bg, frames, alphas, opacity_ramp(args, len(frames)), later_on_top=args.order == "later")
+    save(result, masks, args, out)
 
     if args.debug:
         dbg_dir = out.with_name(out.stem + "_debug")
