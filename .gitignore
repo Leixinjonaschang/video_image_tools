@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Generated figures
+outputs/
+
+# Source videos (large; keep them outside the repo)
+*.mov
+*.MOV
+*.mp4
+*.MP4
+*.m4v
+*.avi
+*.mkv
+*.webm
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
