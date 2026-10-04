@@ -8,7 +8,6 @@ the chosen frames are stitched as feathered strips, one per robot instance, onto
 
 import hashlib
 import os
-import warnings
 from pathlib import Path
 
 import cv2
@@ -17,7 +16,7 @@ import numpy as np
 from .composite import to_lab
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "video_image_tools"
-CACHE_VERSION = 1  # bump when detection/tracking changes so old results aren't reused
+CACHE_VERSION = 2  # bump when detection/tracking changes so old results aren't reused
 
 
 def torch_device() -> str:
@@ -30,6 +29,14 @@ def torch_device() -> str:
     return "cpu"
 
 
+def from_pretrained(cls, model_id: str):
+    """Load from the local Hugging Face cache without the hub's network round-trips; download only if missing."""
+    try:
+        return cls.from_pretrained(model_id, local_files_only=True)
+    except OSError:
+        return cls.from_pretrained(model_id)
+
+
 DETECTOR = "IDEA-Research/grounding-dino-tiny"
 
 
@@ -39,8 +46,8 @@ def detect(frame: np.ndarray, text: str, threshold: float = 0.2) -> list[tuple[l
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
     dev = torch_device()
-    proc = AutoProcessor.from_pretrained(DETECTOR)
-    model = AutoModelForZeroShotObjectDetection.from_pretrained(DETECTOR).to(dev).eval()
+    proc = from_pretrained(AutoProcessor, DETECTOR)
+    model = from_pretrained(AutoModelForZeroShotObjectDetection, DETECTOR).to(dev).eval()
     inputs = proc(images=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), text=[[text]], return_tensors="pt").to(dev)
     with torch.inference_mode():
         outputs = model(**inputs)
@@ -106,75 +113,153 @@ def robot_box(frames: list, box, text: str, fps: float) -> list[float]:
     return box
 
 
+def cache_path(video: Path, start: float, end: float, fps: float, n: int, what: str) -> Path:
+    """Cache file for per-clip results; keyed on the file's identity and the exact frames decoded."""
+    video = Path(video).resolve()
+    stat = video.stat()
+    key = f"v{CACHE_VERSION}|{video}|{stat.st_size}|{stat.st_mtime_ns}|{start}|{end}|{fps}|{n}|{what}"
+    return CACHE_DIR / f"{video.stem}_{start:g}-{end:g}_{hashlib.sha1(key.encode()).hexdigest()[:10]}.npz"
+
+
+def tracked_indices(n: int, stride: int) -> list[int]:
+    """Every stride-th frame plus the last one."""
+    idx = list(range(0, n, stride))
+    return idx if idx[-1] == n - 1 else idx + [n - 1]
+
+
 def track_robot(frames: list, video: Path, start: float, end: float, fps: float, box, text: str,
-                model_id: str, cache: bool = True) -> tuple[np.ndarray, list[float]]:
-    """Robot probability maps for every frame of the clip, plus the first-frame box they came from.
+                model_id: str, cache: bool = True, stride: int = 1) -> tuple[np.ndarray, list[int], list[float]]:
+    """Robot probability maps (uint8, 0-255) for every stride-th frame of the clip and the last one, the
+    indices of those frames, and the first-frame box they came from.
 
     Detection + SAM 2 is the slow part of the pipeline, so the result is cached on disk per clip and
     prompt; re-running with different layout options then skips it."""
-    video = Path(video).resolve()
-    stat = video.stat()
+    from concurrent.futures import ThreadPoolExecutor
+
+    tracked = tracked_indices(len(frames), stride)
     prompt = f"box={[round(float(v), 1) for v in box]}" if box else f"detect={text}"
-    key = f"v{CACHE_VERSION}|{video}|{stat.st_size}|{stat.st_mtime_ns}|{start}|{end}|{fps}|{len(frames)}|{prompt}|{model_id}"
-    path = CACHE_DIR / f"{video.stem}_{start:g}-{end:g}_{hashlib.sha1(key.encode()).hexdigest()[:10]}.npz"
+    path = cache_path(video, start, end, fps, len(frames), f"{prompt}|{model_id}|stride={stride}")
     if cache and path.exists():
         print(f"reusing cached robot tracking ({path}); pass --no-cache to recompute")
         data = np.load(path)
-        return data["probs"].astype(np.float32) / 255, data["box"].tolist()
-    box = robot_box(frames, box, text, fps)
-    print(f"tracking the robot in {len(frames)} frames with {model_id}")
-    probs = np.round(segment_robot(frames, box, model_id) * 255).astype(np.uint8)
+        return data["probs"], tracked, data["box"].tolist()
+    with ThreadPoolExecutor(1) as pool:
+        sam = pool.submit(load_sam, model_id)  # read SAM's weights while the detector runs
+        box = robot_box(frames, box, text, fps)
+        model, proc, dtype = sam.result()
+    print(f"tracking the robot in {len(tracked)} of {len(frames)} frames with {model_id}")
+    probs = segment_robot([frames[i] for i in tracked], box, model, proc, dtype)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, probs=probs, box=np.array(box, float))
-    return probs.astype(np.float32) / 255, box
+    return probs, tracked, box
 
 
-def segment_robot(frames: list, box: tuple, model_id: str) -> np.ndarray:
-    """Per-frame robot probability maps (N, H, W) from SAM 2, prompted with a box on the first frame."""
+def _bf16_attention(module, query, key, value, attention_mask=None, scaling=None, dropout=0.0, **kwargs):
+    """Eager attention with the softmax kept in bfloat16. For SAM 2's memory attention (4096 queries against
+    ~29k memory keys, head_dim 256) this is ~2x faster than SDPA on Apple GPUs, with bf16-level errors."""
     import torch
-    from transformers import Sam2VideoModel, Sam2VideoProcessor
+
+    weights = torch.matmul(query * scaling, key.transpose(2, 3))
+    if attention_mask is not None:
+        weights = weights + attention_mask
+    return torch.matmul(weights.softmax(dim=-1), value).transpose(1, 2).contiguous(), None
+
+
+def load_sam(model_id: str):
+    """SAM 2 video model (on the CPU, ready to move to the GPU), its processor, and the dtype to run in."""
+    import torch
+    from transformers import AttentionInterface, Sam2VideoModel, Sam2VideoProcessor
 
     dev = torch_device()
     # bfloat16 is ~2.5x faster than float32 on GPUs (measured on Apple M5) with near-identical masks.
     fast = dev == "mps" or (dev == "cuda" and torch.cuda.is_bf16_supported())
-    dtype = torch.bfloat16 if fast else torch.float32
-    model = Sam2VideoModel.from_pretrained(model_id).to(dev, dtype=dtype)
-    proc = Sam2VideoProcessor.from_pretrained(model_id)
+    model = from_pretrained(Sam2VideoModel, model_id)
+    if fast:
+        AttentionInterface.register("bf16_eager", _bf16_attention)
+        model.config._attn_implementation = {"": "bf16_eager"}  # memory attention only; sub-models keep SDPA
+    return model, from_pretrained(Sam2VideoProcessor, model_id), torch.bfloat16 if fast else torch.float32
+
+
+def segment_robot(frames: list, box: tuple, model, proc, dtype) -> np.ndarray:
+    """Per-frame robot probability maps (N, H, W) as uint8 0-255 from SAM 2, prompted with a box on the first frame."""
+    import torch
+    import torch.nn.functional as F
+
+    dev = torch_device()
+    model = model.to(dev, dtype=dtype)
     rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
     sess = proc.init_video_session(video=rgb, inference_device=dev, video_storage_device="cpu", dtype=dtype)
     proc.add_inputs_to_inference_session(
         inference_session=sess, frame_idx=0, obj_ids=1, input_boxes=[[[float(v) for v in box]]]
     )
-    probs = np.zeros((len(frames), *frames[0].shape[:2]), np.float32)
-    size = [[sess.video_height, sess.video_width]]
+    logits = [None] * len(frames)
+    h, w = frames[0].shape[:2]
+    probs = np.empty((len(frames), h, w), np.uint8)
     with torch.inference_mode():
         model(inference_session=sess, frame_idx=0)
         for out in model.propagate_in_video_iterator(sess, show_progress_bar=True):
-            m = proc.post_process_masks([out.pred_masks.float()], original_sizes=size, binarize=False)[0]
-            probs[out.frame_idx] = torch.sigmoid(m[0, 0]).cpu().numpy()
+            logits[out.frame_idx] = out.pred_masks
+        for a in range(0, len(frames), 8):  # upsample in chunks instead of one GPU->CPU copy per frame
+            up = F.interpolate(torch.cat(logits[a:a + 8]).float(), (h, w), mode="bilinear", align_corners=False)
+            probs[a:a + 8] = up[:, 0].sigmoid().mul(255).round().to(torch.uint8).cpu().numpy()
     return probs
 
 
-def detect_people(frames: list, indices: list[int], robot: list) -> dict[int, np.ndarray]:
-    """Dilated person masks (excluding the robot) for the given frames, from COCO Mask R-CNN."""
-    import torch
-    from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
+def fill_untracked(probs: np.ndarray, tracked: list[int], n: int) -> tuple[list, list]:
+    """Robot masks and (x, y, w, h) boxes for all n frames from the masks at the tracked frames.
 
-    dev = torch_device()
-    model = maskrcnn_resnet50_fpn_v2(weights=MaskRCNN_ResNet50_FPN_V2_Weights.DEFAULT).eval().to(dev)
-    h, w = frames[0].shape[:2]
+    In-between frames get the union of their tracked neighbours' masks, dilated by half the distance the
+    robot moved: generous enough to keep the robot out of registration and background fill."""
+    masks, boxes = [None] * n, [None] * n
+    for p, i in zip(probs, tracked):
+        masks[i] = (p >= 128).astype(np.uint8)
+        boxes[i] = cv2.boundingRect(masks[i]) if masks[i].any() else None
+    for a, b in zip(tracked[:-1], tracked[1:]):
+        if b - a < 2:
+            continue
+        ba, bb = boxes[a], boxes[b]
+        shift = 0.0
+        if ba and bb:
+            shift = float(np.hypot(ba[0] + ba[2] / 2 - bb[0] - bb[2] / 2, ba[1] + ba[3] / 2 - bb[1] - bb[3] / 2))
+        r = int(np.ceil(8 + shift / 2))
+        union = cv2.dilate(masks[a] | masks[b], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+        for j in range(a + 1, b):
+            masks[j] = union
+            t = (j - a) / (b - a)
+            boxes[j] = tuple((1 - t) * np.array(ba, float) + t * np.array(bb, float)) if ba and bb else ba or bb
+    return masks, boxes
+
+
+def detect_people(frames: list, indices: list[int], robot: list, cache: Path | None = None,
+                  reuse: bool = True) -> dict[int, np.ndarray]:
+    """Dilated person masks (excluding the robot) for the given frames, from COCO Mask R-CNN.
+
+    Raw detections are cached per frame, so re-runs that pick frames seen before skip the model entirely."""
+    raw = {}
+    if cache and reuse and cache.exists():
+        with np.load(cache) as data:
+            raw = {int(k): data[k] for k in data.files}
+    missing = [i for i in indices if i not in raw]
+    if missing:
+        import torch
+        from torchvision.models.detection import MaskRCNN_ResNet50_FPN_V2_Weights, maskrcnn_resnet50_fpn_v2
+
+        dev = torch_device()
+        model = maskrcnn_resnet50_fpn_v2(weights=MaskRCNN_ResNet50_FPN_V2_Weights.DEFAULT, box_score_thresh=0.5).eval().to(dev)
+        h, w = frames[0].shape[:2]
+        batch = [torch.from_numpy(cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)).permute(2, 0, 1).to(dev).float().div(255)
+                 for i in missing]
+        with torch.inference_mode():
+            outs = model(batch)
+        for i, out in zip(missing, outs):
+            keep = out["labels"] == 1
+            raw[i] = (out["masks"][keep, 0] > 0.5).any(0).cpu().numpy().astype(np.uint8) if keep.any() \
+                else np.zeros((h, w), np.uint8)
+        if cache:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(cache, **{str(i): m for i, m in raw.items()})
     grow = np.ones((25, 25), np.uint8)
-    people = {}
-    with torch.inference_mode():
-        for i in indices:
-            x = torch.from_numpy(cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().div(255)
-            out = model([x.to(dev)])[0]
-            keep = (out["labels"] == 1) & (out["scores"] > 0.5)
-            m = np.zeros((h, w), np.uint8)
-            if keep.any():
-                m = (out["masks"][keep, 0] > 0.5).any(0).cpu().numpy().astype(np.uint8)
-            people[i] = cv2.dilate(m & (1 - robot[i]), grow)
-    return people
+    return {i: cv2.dilate(raw[i] & (1 - robot[i]), grow) for i in indices}
 
 
 def _chain(steps: list) -> np.ndarray:
@@ -185,14 +270,23 @@ def _chain(steps: list) -> np.ndarray:
     return np.stack(out)
 
 
-def far_features(frames: list, robot: list) -> list:
-    """SIFT keypoints/descriptors outside the robot; at night these are mostly distant lights."""
+FILL_SOURCES = 40
+
+
+def fill_sources(n: int) -> list[int]:
+    """Frames remove_people takes background from: about FILL_SOURCES evenly spread over the clip."""
+    return list(range(0, n, max(1, n // FILL_SOURCES)))
+
+
+def far_features(frames: list, robot: list, needed: list[int]) -> dict:
+    """SIFT keypoints/descriptors outside the robot for the needed frames; at night mostly distant lights."""
     sift = cv2.SIFT_create(4000)
     grow = np.ones((21, 21), np.uint8)
-    feats = []
-    for f, r in zip(frames, robot):
-        kps, desc = sift.detectAndCompute(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (1 - cv2.dilate(r, grow)) * 255)
-        feats.append((np.float32([k.pt for k in kps]), desc))
+    feats = {}
+    for i in needed:
+        kps, desc = sift.detectAndCompute(cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY),
+                                          (1 - cv2.dilate(robot[i], grow)) * 255)
+        feats[i] = (np.float32([k.pt for k in kps]), desc)
     return feats
 
 
@@ -210,25 +304,31 @@ def far_homography(src: tuple, dst: tuple, min_inliers: int = 20) -> np.ndarray 
     return hm
 
 
-def ground_motion(frames: list, robot: list) -> np.ndarray:
-    """A[i] maps frame i to frame 0 with a similarity transform fitted to the ground near the robot's feet."""
+def dense_flows(frames: list) -> list:
+    """DIS optical flow from each frame to the previous one, sampled on ground_motion's 8 px grid.
+
+    Needs no robot masks, so it can run on the CPU while SAM 2 tracks on the GPU."""
     clahe = cv2.createCLAHE(3.0, (8, 8))
     gray = [clahe.apply(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)) for f in frames]
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-    h, w = gray[0].shape
+    return [None] + [dis.calc(gray[i], gray[i - 1], None)[4::8, 4::8].copy() for i in range(1, len(frames))]
+
+
+def ground_motion(flows: list, robot: list, boxes: list) -> np.ndarray:
+    """A[i] maps frame i to frame 0 with a similarity transform fitted to the ground near the robot's feet."""
+    h, w = robot[0].shape
     ys, xs = np.mgrid[4:h:8, 4:w:8]
     grid = np.stack([xs.ravel(), ys.ravel()], 1).astype(np.float32)
     grow = np.ones((31, 31), np.uint8)
     steps, last, band = [], np.eye(3), (0.5 * h, h)
-    for i in range(1, len(frames)):
-        if robot[i].any():
-            _, y, _, bh = cv2.boundingRect(robot[i])
+    for i in range(1, len(flows)):
+        if boxes[i] is not None:
+            _, y, _, bh = boxes[i]
             band = (y + 0.5 * bh, y + 1.5 * bh)
-        flow = dis.calc(gray[i], gray[i - 1], None)
         free = cv2.dilate(robot[i], grow)[grid[:, 1].astype(int), grid[:, 0].astype(int)] == 0
         keep = free & (grid[:, 1] > band[0]) & (grid[:, 1] < band[1])
         src = grid[keep]
-        dst = src + flow[src[:, 1].astype(int), src[:, 0].astype(int)]
+        dst = src + flows[i][(src[:, 1].astype(int) - 4) // 8, (src[:, 0].astype(int) - 4) // 8]
         if len(src) >= 20:  # otherwise assume the camera kept its previous motion
             m, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=1.5)
             if m is not None and inl.sum() >= 20:
@@ -237,7 +337,16 @@ def ground_motion(frames: list, robot: list) -> np.ndarray:
     return _chain(steps)
 
 
-def remove_people(frames: list, i: int, hole: np.ndarray, feats: list, robot: list, sources: int = 40) -> np.ndarray:
+def _nanmedian(stack: np.ndarray) -> np.ndarray:
+    """np.nanmedian over axis 0, several times faster: one sort (NaNs go last), then the middle valid value(s)."""
+    s = np.sort(np.ascontiguousarray(np.moveaxis(stack, 0, -1)), axis=-1)
+    n = (~np.isnan(s)).sum(-1, keepdims=True)
+    lo = np.take_along_axis(s, np.maximum((n - 1) // 2, 0), -1)
+    hi = np.take_along_axis(s, n // 2, -1)  # with no valid value both pick a NaN, like nanmedian
+    return ((lo + hi) / 2)[..., 0]
+
+
+def remove_people(frames: list, i: int, hole: np.ndarray, feats: dict, robot: list) -> np.ndarray:
     """Fill `hole` in frame i with the median of other frames aligned on the distant background.
 
     Standing people sit at a different depth than the far background, so in far-aligned frames they
@@ -246,9 +355,10 @@ def remove_people(frames: list, i: int, hole: np.ndarray, feats: list, robot: li
     x, y, bw, bh = cv2.boundingRect(cv2.dilate(hole, np.ones((61, 61), np.uint8)))
     grow = np.ones((15, 15), np.uint8)
     ones = np.ones((h, w), np.uint8)
-    stride = max(1, len(frames) // sources)
+    sources = fill_sources(len(frames))
+    stride = sources[1] - sources[0] if len(sources) > 1 else 1
     stack = []
-    for j in range(0, len(frames), stride):
+    for j in sources:
         if abs(j - i) < stride or (hj := far_homography(feats[j], feats[i])) is None:
             continue
         m = np.array([[1, 0, -x], [0, 1, -y], [0, 0, 1]]) @ hj
@@ -260,9 +370,7 @@ def remove_people(frames: list, i: int, hole: np.ndarray, feats: list, robot: li
     out = frames[i].astype(np.float32)
     if not stack:
         return frames[i]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN pixels are handled below
-        med = np.nanmedian(np.stack(stack), axis=0)
+    med = _nanmedian(np.stack(stack))
     patch = out[y:y + bh, x:x + bw]
     hp = hole[y:y + bh, x:x + bw].astype(bool)
     missing = np.isnan(med).any(2)
@@ -281,12 +389,13 @@ def remove_people(frames: list, i: int, hole: np.ndarray, feats: list, robot: li
     return result
 
 
-def stitch(frames: dict, A: np.ndarray, probs: np.ndarray, indices: list[int],
+def stitch(frames: dict, A: np.ndarray, probs: dict, indices: list[int],
            later_on_top: bool = True, feather: float = 40.0):
     """Blend the chosen frames as feathered strips around each robot, then paste the robots on top.
 
+    `probs` maps each chosen frame to its robot probability map (float 0-1).
     Returns (canvas, coverage mask, robot masks in canvas coordinates)."""
-    h, w = probs.shape[1:]
+    h, w = probs[indices[0]].shape
     ref = indices[len(indices) // 2]
     A = np.linalg.inv(A[ref]) @ A
     corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], float).T

@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .cli import draw_grid, parse_time
+from .cli import TRACK_FPS, draw_grid, parse_time
 from .video import probe, read_clip
 
 
@@ -106,9 +106,6 @@ def pick_static(info, targets: list, snap: float, crop, clip: tuple[float, float
     return picked
 
 
-TRACK_FPS = 10
-
-
 def pick_following(args, info, targets: list) -> list:
     """Crop every keyframe around the robot at a constant size.
 
@@ -118,9 +115,9 @@ def pick_following(args, info, targets: list) -> list:
 
     fps = args.fps or min(info.fps, TRACK_FPS)
     tracked = [(t, f.copy()) for t, f in read_clip(info, args.start, args.end, fps=fps)]
-    probs, _ = track_robot([f for _, f in tracked], args.video, args.start, args.end, fps, args.box, args.detect,
-                           args.sam_model, cache=not args.no_cache)
-    seen = [(t, cv2.boundingRect((p > 0.5).astype(np.uint8))) for (t, _), p in zip(tracked, probs) if (p > 0.5).any()]
+    probs, _, _ = track_robot([f for _, f in tracked], args.video, args.start, args.end, fps, args.box, args.detect,
+                              args.sam_model, cache=not args.no_cache)
+    seen = [(t, cv2.boundingRect((p >= 128).astype(np.uint8))) for (t, _), p in zip(tracked, probs) if (p >= 128).any()]
     if not seen:
         raise SystemExit("robot not found in the clip; try a tighter --box or a different --detect text")
     times = np.array([t for t, _ in seen])

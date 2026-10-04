@@ -55,6 +55,9 @@ def read_clip(info: VideoInfo, start: float, end: float, scale: float = 1.0, fps
         FFMPEG, "-hide_banner", "-loglevel", "error",
         "-ss", f"{start:.4f}", "-t", f"{end - start:.4f}", "-i", str(info.path),
         "-an", "-vf", ",".join(filters),
+        # iPhone clips are often variable-frame-rate with a 120 tbr time base; without passthrough
+        # ffmpeg pads them to 120 fps with duplicate frames (4x the work, wrong timestamps).
+        "-fps_mode", "passthrough",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
     ]
     step = 1.0 / (fps or info.fps)

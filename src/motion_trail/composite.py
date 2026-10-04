@@ -67,8 +67,8 @@ def centroid(mask: np.ndarray | None) -> np.ndarray | None:
     return np.array([xs.mean(), ys.mean()])
 
 
-def select_indices(centroids: list, n: int, spacing: str) -> list[int]:
-    """Pick n frame indices, evenly spaced in time or along the object's path."""
+def select_indices(centroids: list, n: int, spacing: str, window: int = 9) -> list[int]:
+    """Pick n frame indices, evenly spaced in time or along the object's path (smoothed over `window` points)."""
     valid = [i for i, c in enumerate(centroids) if c is not None]
     if len(valid) < n:
         raise ValueError(f"object detected in only {len(valid)} frames, fewer than the {n} requested")
@@ -76,7 +76,7 @@ def select_indices(centroids: list, n: int, spacing: str) -> list[int]:
         targets = np.linspace(valid[0], valid[-1], n)
         return [min(valid, key=lambda i: abs(i - t)) for t in targets]
     pts = np.array([centroids[i] for i in valid])
-    k = min(9, len(pts) // 2 * 2 - 1)
+    k = min(window, len(pts) // 2 * 2 - 1)
     if k >= 3:  # smooth so detection jitter while standing still doesn't count as travel
         padded = np.pad(pts, ((k // 2, k // 2), (0, 0)), mode="edge")
         pts = np.stack([np.convolve(padded[:, j], np.ones(k) / k, mode="valid") for j in range(2)], 1)

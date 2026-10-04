@@ -136,40 +136,56 @@ def opacity_ramp(args, n: int) -> np.ndarray:
     return np.linspace(*args.opacity, n) if n > 1 else np.array([args.opacity[1]])
 
 
+TRACK_FPS = 10  # SAM 2 tracking rate: in-between frames only need stand-in masks
+
+
 def run_moving(args, info, out: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
     from . import moving
 
     fps = args.fps or info.fps
     frames = [f.copy() for _, f in read_clip(info, args.start, args.end, fps=args.fps)]
-    probs, box = moving.track_robot(frames, args.video, args.start, args.end, fps, args.box, args.detect,
-                                    args.sam_model, cache=not args.no_cache)
-    robot = [(p > 0.5).astype(np.uint8) for p in probs]
-    print("registering frames")
-    ground = moving.ground_motion(frames, robot)
+    n = len(frames)
+    stride = max(1, round(fps / TRACK_FPS))
+    with ThreadPoolExecutor(1) as pool:
+        flows = pool.submit(moving.dense_flows, frames)  # CPU work while the GPU detects and tracks
+        probs, tracked, box = moving.track_robot(frames, args.video, args.start, args.end, fps, args.box, args.detect,
+                                                 args.sam_model, cache=not args.no_cache, stride=stride)
+        robot, boxes = moving.fill_untracked(probs, tracked, n)
+        print("registering frames")
+        ground = moving.ground_motion(flows.result(), robot, boxes)
 
-    if args.times:
-        indices = sorted({min(round((t - args.start) * fps), len(frames) - 1) for t in args.times})
-    else:
-        feet = []
-        for a, r in zip(ground, robot):
-            if not r.any():
-                feet.append(None)
-                continue
-            x, y, w, h = cv2.boundingRect(r)
-            feet.append((a @ [x + w / 2, y + h, 1])[:2])
-        indices = select_indices(feet, args.num, args.spacing)
-    print("using frames at t =", ", ".join(f"{args.start + i / fps:.2f}s" for i in indices))
+        # Robot instances come from tracked frames only: their masks are exact, the others are stand-ins.
+        if args.times:
+            wanted = [min(round((t - args.start) * fps), n - 1) for t in args.times]
+            indices = sorted({min(tracked, key=lambda i: abs(i - w)) for w in wanted})
+        else:
+            tset = set(tracked)
+            feet = []
+            for i, (a, r) in enumerate(zip(ground, robot)):
+                if i not in tset or not r.any():
+                    feet.append(None)
+                    continue
+                x, y, w, h = cv2.boundingRect(r)
+                feet.append((a @ [x + w / 2, y + h, 1])[:2])
+            indices = select_indices(feet, args.num, args.spacing, window=max(3, (9 // stride) | 1))
+        print("using frames at t =", ", ".join(f"{args.start + i / fps:.2f}s" for i in indices))
 
-    clean = {i: frames[i] for i in indices}
-    if not args.keep_people:
-        print("removing people")
-        people = moving.detect_people(frames, indices, robot)
-        feats = moving.far_features(frames, robot)
-        for i in indices:
-            if people[i].any():
-                clean[i] = moving.remove_people(frames, i, people[i], feats, robot)
+        clean = {i: frames[i] for i in indices}
+        if not args.keep_people:
+            print("removing people")
+            needed = sorted(set(moving.fill_sources(n)) | set(indices))
+            feats = pool.submit(moving.far_features, frames, robot, needed)  # CPU, while Mask R-CNN uses the GPU
+            people_cache = moving.cache_path(args.video, args.start, args.end, fps, n, "people")
+            people = moving.detect_people(frames, indices, robot, people_cache, reuse=not args.no_cache)
+            feats = feats.result()
+            for i in indices:
+                if people[i].any():
+                    clean[i] = moving.remove_people(frames, i, people[i], feats, robot)
 
-    result, coverage, masks = moving.stitch(clean, ground, probs, indices, later_on_top=args.order == "later")
+    alphas = {i: probs[tracked.index(i)].astype(np.float32) / 255 for i in indices}
+    result, coverage, masks = moving.stitch(clean, ground, alphas, indices, later_on_top=args.order == "later")
     save(result, masks, args, out, coverage)
 
     if args.debug:
@@ -178,7 +194,7 @@ def run_moving(args, info, out: Path) -> None:
         x0, y0, x1, y1 = (int(v) for v in box)
         cv2.imwrite(str(dbg_dir / "box.jpg"), cv2.rectangle(frames[0].copy(), (x0, y0), (x1, y1), (0, 0, 255), 3))
         for k, i in enumerate(indices):
-            cv2.imwrite(str(dbg_dir / f"mask_{k:02d}.jpg"), overlay_debug(clean[i], probs[i]))
+            cv2.imwrite(str(dbg_dir / f"mask_{k:02d}.jpg"), overlay_debug(clean[i], alphas[i]))
         print(f"debug images in {dbg_dir}")
 
 
